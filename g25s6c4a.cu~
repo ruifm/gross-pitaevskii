@@ -1,0 +1,368 @@
+#include <iostream>
+#include <fstream>
+#include <cstdlib>
+#include <cmath>
+#include <string>
+#include <cstring>
+#include <ctime>
+#include <cuda.h>
+#include "cuda_common.h"
+#include <thrust/version.h>
+#include <thrust/transform.h>
+#include <thrust/device_vector.h>
+#include <thrust/host_vector.h>
+#include <thrust/sort.h>
+
+#ifdef __CUDACC__
+#define CUDA_CALLABLE_MEMBER __host__ __device__
+#else
+#define CUDA_CALLABLE_MEMBER
+#endif
+
+
+//definicao do valor das constantes
+#define g 0.01
+#define omega 0.85
+#define G 1000.0
+#define L 10.0
+#define N 128
+#define S 16384
+#define dt 0.00390625
+
+using namespace std;
+
+class Complex { 
+	
+	
+  
+ public: //variaveis publicas
+  double re; //parte rea
+  double im; //parte imaginaria
+  CUDA_CALLABLE_MEMBER explicit Complex(){}; 
+  CUDA_CALLABLE_MEMBER explicit Complex(double _re,double _im) : re(_re) , im(_im) {} // construcao explicita
+  CUDA_CALLABLE_MEMBER Complex(const Complex& comp) : re(comp.re) , im(comp.im) {} //construtor por copia
+  CUDA_CALLABLE_MEMBER Complex& operator=(const Complex& c){
+  	
+  	re=c.re;
+
+  	im=c.im;
+  	//swap(re,temp.re);
+  	//swap(im,temp.im);
+  	return *this;
+  }
+  CUDA_CALLABLE_MEMBER ~Complex(){}
+  
+	CUDA_CALLABLE_MEMBER friend double mod(const Complex& c); //modulo
+	CUDA_CALLABLE_MEMBER friend Complex operator+(const Complex& c1, const Complex& c2); //soma
+	CUDA_CALLABLE_MEMBER friend Complex operator-(const Complex& c1, const Complex& c2); //subtracao
+	CUDA_CALLABLE_MEMBER friend Complex operator*(const Complex& c1, const Complex& c2); //produto
+	CUDA_CALLABLE_MEMBER friend Complex operator/(const Complex& c1, const Complex& c2); //divisao
+	CUDA_CALLABLE_MEMBER friend Complex c(double k);
+	CUDA_CALLABLE_MEMBER friend Complex conj(const Complex& c);
+};
+
+double mod(const Complex& c){  //modulo
+  return sqrt(c.re*c.re+c.im*c.im);
+}
+
+Complex operator+(const Complex& c1, const Complex& c2) {  //soma 
+  double real, imag;
+  real=c1.re+c2.re;
+  imag=c1.im+c2.im;
+  Complex plus(real, imag);
+  return plus;
+}
+
+Complex operator-(const Complex& c1, const Complex& c2) {  //subtracao
+  double real, imag;
+  real=c1.re-c2.re;
+  imag=c1.im-c2.im;
+  Complex sub(real, imag);
+  return sub;
+}
+ 
+Complex operator*(const Complex& c1, const Complex& c2) {  //produto
+  double real, imag;
+  real=c1.re*c2.re - c1.im*c2.im;
+  imag=c1.re*c2.im + c1.im*c2.re;
+  Complex prod(real, imag);
+  return prod;
+}
+
+Complex conj(const Complex& c) { //conjugado
+  double real, imag;
+  real=c.re;
+  imag=c.im;
+  Complex conju(real, -imag);
+  return conju;
+}
+
+Complex c(double k){  //real
+  Complex res(k,0.);
+  return res;
+}    
+
+Complex operator/(const Complex& c1, const Complex& c2) {  //divisao
+  return c(1./(mod(c2)*mod(c2)))*c1*conj(c2);
+}
+
+
+
+__host__ __device__ Complex F(Complex ay1, Complex ay2, Complex ax1, Complex ax2, Complex a,int i,int j){  //funcao F
+  Complex k(-g,1.);
+  Complex iomg(0.,-omega);
+  Complex h=c(2.*L/((double)N-1.));
+ 	Complex dx2 = (ax1+ax2-a-a)/(h*h);
+ 	Complex dy2 = (ay1+ay2-a-a)/(h*h);
+ 	Complex lap = dx2+dy2;
+ 	Complex dx = (ax1-ax2)/(h*c(2.));
+ 	Complex dy = (ay1-ay2)/(h*c(2.));
+  Complex x=c(-L)+c(i)*h;
+  Complex y=c(-L)+c(j)*h;
+	
+	return (c(-0.5)*lap   +   c(0.5)*(x*x+y*y)*a   +  c(G*mod(a)*mod(a))*a    +  iomg*(x*dy-y*dx))/k;
+}
+//kernels
+__global__ void k1( Complex* psi ,Complex* psi1, Complex* psi2)
+{
+  
+  int i=threadIdx.y+blockIdx.y*blockDim.y;
+  int j=threadIdx.x+blockIdx.x*blockDim.x;
+	int index=j*N+i;	
+  if( (i > 0 && i < N-1) && (j > 0 && j < N-1) )
+    { 
+      psi1[j*N+i] = psi[j*N+i] + c(dt)*F(psi[(j+1)*N+i],psi[(j-1)*N+i],psi[j*N+i+1],psi[j*N+i-1],psi[index],i,j);
+    }
+
+}
+
+__global__ void k2( Complex* psi ,Complex* psi1,Complex* psi2)
+{
+
+  
+  int i=threadIdx.y+blockIdx.y*blockDim.y;
+  int j=threadIdx.x+blockIdx.x*blockDim.x;
+
+  if( (i > 0 && i < N-1) && (j > 0 && j < N-1) )
+    { 
+      int index=j*N+i;	
+      psi2[index] = c(3.0/4)*psi[index] + c(1.0/4)*psi1[index] + c(dt*1.0/4)*F(psi1[(j+1)*N+i],psi1[(j-1)*N+i],psi1[j*N+i+1],psi1[j*N+i-1],psi1[index],i,j);
+    }
+}
+
+__global__ void k3(Complex* psi,Complex* psi1, Complex* psi2)
+{
+  int i=threadIdx.y+blockIdx.y*blockDim.y;
+  int j=threadIdx.x+blockIdx.x*blockDim.x;
+	
+  if( (i > 0 && i < N-1) && (j > 0 && j < N-1) )
+    { 
+      int index=j*N+i;	    
+      psi[index] = c(1.0/3.)*psi[index] + c(2.0/3.)*psi2[index] + c(dt*2.0/3.)*F(psi2[(j+1)*N+i],psi2[(j-1)*N+i],psi2[j*N+i+1],psi2[j*N+i-1],psi2[index],i,j);
+    }	
+}
+
+__global__ void k4( Complex* psi,Complex* psi1, double *Normc)
+{
+  double h2= (2.*L/((double)N-1.))*(2.*L/((double)N-1.));
+
+  int i=threadIdx.y+blockIdx.y*blockDim.y;
+  int j=threadIdx.x+blockIdx.x*blockDim.x;
+
+  if( (i > 0 && i < N-1) && (j > 0 && j < N-1) )
+    { 
+      int index=j*N +i;    
+
+      Normc[index]=mod(psi[index])*mod(psi[index])*h2;
+    }
+}
+
+__global__ void k5( Complex* psi , double Norm)
+{
+  int i=threadIdx.y+blockIdx.y*blockDim.y;
+  int j=threadIdx.x+blockIdx.x*blockDim.x;
+
+  if( (i > 0 && i < N-1) && (j > 0 && j < N-1) )
+    { 
+      int index=j*N +i;
+      psi[index]=psi[index]/c(sqrt(Norm));
+    }
+}
+
+
+
+
+
+int main(void){
+  
+  int i,j,n, cpf;
+  double h,tf;
+  
+  h=2.*L/((double)N-1.);
+  cout << "gamma = " << g << endl;
+  cout << "Omega = " << omega << endl;
+  cout << "G = " << G << endl;
+  cout << "N = " << N << endl;
+  cout << "L = " << L << endl;
+  cout << "h = " << h << endl;
+  cout << "dt = " << dt << endl;
+  cout << "tf = ";
+  cin >> tf;
+  int nmax=tf/dt;
+  cout << "# cycles = " << nmax << endl;
+  cout << "cycles per frame = ";
+  cin >> cpf;
+  int nframes = nmax/cpf;
+  cout << "# frames = " << nframes << endl;
+  cout << "About " <<nframes*45./1024. <<" Mb will be used" << endl;
+  
+  cout << "Progress:" << endl;
+  //alocacao
+  Complex * psi=(Complex *) malloc(S*sizeof(Complex));	
+  Complex * psi1=(Complex *) malloc(S*sizeof(Complex));
+  Complex * psi2=(Complex *) malloc(S*sizeof(Complex));
+  double * Norm = (double *) malloc(S*sizeof(double));
+	double Nm=0;
+  Complex *psic;
+  Complex *psi1c;
+  Complex *psi2c;
+  double *Normc;
+
+  cudaMalloc((void**)&psic, S*sizeof(Complex));
+  cudaMalloc((void**)&psi1c, S*sizeof(Complex));
+  cudaMalloc((void**)&psi2c, S*sizeof(Complex));
+  cudaMalloc((void**)&Normc, S*sizeof(double));
+	
+  thrust::device_ptr<double> Normc2=thrust::device_pointer_cast(Normc);
+  	
+  Complex one(1.,0.);
+  Complex zero(0.,0.);
+  for(i=0;i<S;++i){
+   
+      if(i<N||i>=S-N||(i%N)==0||((i-(N-1))%N)==0) {
+	psi[i]=zero;
+	psi1[i]=zero;
+	psi2[i]=zero;
+      }
+      else {
+	psi[i]=c(1./((N-2.)*h))*one;
+	psi1[i]=c(1./((N-2.)*h))*one;
+	psi2[i]=c(1./((N-2.)*h))*one;
+      }
+    
+  }
+  ofstream out("data4a");
+  for(i=1;i<N-1;++i){
+    for(j=1;j<N-1;++j){
+      out << -L+i*h << "\t" << -L+j*h << "\t" << mod(psi[j*N+i])*mod(psi[j*N+i]) << endl;
+    }
+  }
+  clock_t t=clock();
+  double v=cpf;
+  int pop=v/cpf;
+  
+  
+  
+  cudaMemcpy(psic, psi, S*sizeof(Complex), cudaMemcpyHostToDevice) ;
+  cudaMemcpy(psi1c, psi1, S*sizeof(Complex), cudaMemcpyHostToDevice) ;
+  cudaMemcpy(psi2c, psi2, S*sizeof(Complex), cudaMemcpyHostToDevice) ;
+  cudaMemcpy(Normc, Norm, S*sizeof(double), cudaMemcpyHostToDevice) ;	
+	
+  dim3 tpb(16, 16, 1);        
+  dim3 bpg((N + tpb.x - 1)/ tpb.x, (N + tpb.y - 1) / tpb.y, 1);		
+	
+  k4<<<bpg,tpb>>>(psic,psi1c, Normc); //sincronizao de threads
+  cudaThreadSynchronize();
+	
+  Nm=thrust::reduce(Normc2,Normc2+S);
+	
+  k5<<<bpg,tpb>>>(psic,Nm);
+  cudaThreadSynchronize();
+  Nm=0;
+  
+  
+  for(n=0;n<nmax;n++){
+    if(!(n%cpf)){
+      out.open("data4a");  // abertura do ficheiro de escrita de dados
+      ofstream script("script4a");  //  criacao do script 
+      script << "set term png" << endl;
+      script << "set output \"frame" << n/cpf << ".png\"" << endl;
+      script << "set title \"" << n/cpf <<"\"" << endl;
+      script << "set xrange [-10:10]" << endl;
+      script << "set yrange [-10:10]" << endl;
+      script << "set cbrange [0:*]" << endl;
+      script << "set size square" << endl;
+      script << "set xlabel \"x\"" << endl;
+      script << "set ylabel \"y\"" << endl;
+      script << "set clabel \"|psi|^2\"" << endl;
+      script << "plot \"data4a\" using 1:2:3 notitle w p pt 7 ps 2 lt palette" << endl;
+      script.close();
+    }
+    	//runge kutta
+    	k1<<<bpg,tpb>>>(psic, psi1c,psi2c);    
+      cudaThreadSynchronize();
+		
+      k2<<<bpg,tpb>>>(psic, psi1c, psi2c);  
+      cudaThreadSynchronize();	
+		
+      k3<<<bpg,tpb>>>(psic,psi1c, psi2c);
+      cudaThreadSynchronize();
+		
+      k4<<<bpg,tpb>>>(psic,psi1c, Normc);
+      cudaThreadSynchronize();
+		
+		//normalizacao
+      Nm=thrust::reduce(Normc2,Normc2+S);
+		
+      k5<<<bpg,tpb>>>(psic, Nm);
+      cudaThreadSynchronize();	
+			Nm=0;
+		
+    if(!(n%cpf)){
+    	cudaMemcpy( psi, psic, S*sizeof(Complex), cudaMemcpyDeviceToHost );
+      for(i=1;i<N-1;++i){
+	for(j=1;j<N-1;++j){		//escrita no ficheiro de dados
+	  out << -L+i*h << "\t" << -L+j*h << "\t" << mod(psi[j*N+i])*mod(psi[j*N+i]) << endl;
+	}
+      }
+      out.close();  //fecho do ficheiro de escrita de dados
+      if(!system("gnuplot script4a"))  //criacao do frame
+      //for(int k=0; k<10000000;k++) Nm+=k;
+	if(!(n%(pop*cpf))){                     //  progress bar
+	  v=((double)pop*cpf)/(((double)clock()-(double)t)/CLOCKS_PER_SEC);
+	  if(v==0) v=1.;
+	  cout << "\r" << n*100./nmax << "%    " << "f = " << v << " cyc/sec    ETA = " << (int)((((double)nmax-(double)n)/v)/60.) << "min  " << (int)(((double)nmax-(double)n)/v)-60*(int)((((double)nmax-(double)n)/v)/60.) << " sec              ";					
+	  cout << "\n[ ";
+	  for(i=0;i<100*n/nmax;++i) cout << "█";
+	  for(i=0;i<100-100*n/nmax;++i) cout << " ";
+	  cout << "]";
+	  cout  << flush;
+	  cout << "\e[A\r";			
+	}
+    }
+    if(!(n%(pop*cpf))){
+      t=clock();
+      if(v<100.)
+	pop=((int)v)/cpf;
+      if(pop==0) pop=1;
+    }
+		
+  }//libertacao de memoria
+  free(psi);
+  free(psi1);
+  free(psi2);
+  free(Norm);
+
+  cudaFree(psic);
+  cudaFree(psi1c);
+  cudaFree(psi2c);
+  cudaFree(Normc);
+    
+  cudaThreadExit();
+   
+  cout << endl;
+  cout << endl;
+  
+	return 0;
+ 
+}
